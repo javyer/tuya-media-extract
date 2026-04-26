@@ -12,12 +12,15 @@ lossless MKV files — one file per day, with synchronized audio and video.
 
 ## Background
 
-This tool was reverse-engineered from a **Tuya SmartLife camera** running
+This tool was reverse-engineered from **Tuya SmartLife cameras** running
 firmware **v79.1.40**, recording in **continuous mode** (not event/motion mode)
 to a FAT32 (vfat) micro-SD card.
 
 The Tuya Android app can play footage directly from the card with audio, but
 provides no way to export full-day recordings to a PC. This tool fills that gap.
+
+Two audio codecs have been identified across different camera models — the tool
+**auto-detects** the correct one.
 
 ---
 
@@ -42,7 +45,7 @@ this on the SD card:
 
 - One **session folder** = **10 minutes** of continuous footage
 - One **`.media` file** = **10 seconds** of footage
-- A full day = ~144 session folders = ~8642 `.media` files
+- A full day = ~144 session folders = ~8642 `.media` files (measured)
 
 ---
 
@@ -56,21 +59,21 @@ raw H264 but misses the audio track entirely.
 
 Every chunk starts with a **24-byte header**:
 
-| Offset | Type       | Description                          |
-|--------|------------|--------------------------------------|
-| 0      | uint32 LE  | Chunk type (see below)               |
-| 4      | uint32 LE  | Payload size in bytes                |
-| 8      | uint64 LE  | Timestamp (camera epoch)             |
-| 16     | uint64 LE  | Unknown (sequence / flags)           |
-| 24     | `<payload>`| Raw H264 NAL units or PCM samples    |
+| Offset | Type        | Description                        |
+|--------|-------------|------------------------------------|
+| 0      | uint32 LE   | Chunk type (see below)             |
+| 4      | uint32 LE   | Payload size in bytes              |
+| 8      | uint64 LE   | Timestamp (camera epoch)           |
+| 16     | uint64 LE   | Unknown (sequence / flags)         |
+| 24     | `<payload>` | Raw H264 NAL units or audio samples|
 
 ### Chunk Types
 
-| Type | Content                                      |
-|------|----------------------------------------------|
-| `0`  | Video P/B-frame (inter, raw H264 NAL)        |
-| `1`  | Video I-frame / keyframe (SPS + PPS + IDR)   |
-| `3`  | Audio frame (PCM 16-bit signed LE)           |
+| Type | Content                                    |
+|------|--------------------------------------------|
+| `0`  | Video P/B-frame (inter, raw H264 NAL)      |
+| `1`  | Video I-frame / keyframe (SPS + PPS + IDR) |
+| `3`  | Audio frame (PCM or G.711 µ-law)           |
 
 ### Video Stream
 
@@ -83,11 +86,15 @@ Every chunk starts with a **24-byte header**:
 
 ### Audio Stream
 
-- Codec: **Raw PCM 16-bit signed little-endian**
-- Sample rate: **16000 Hz**
-- Channels: **Mono**
-- Chunk size: **1280 bytes** = 640 samples = 40 ms per chunk
-- ~250 audio chunks per 10-second `.media` file
+Two codecs have been identified depending on camera model:
+
+| Codec          | Sample rate | Bit depth | Chunk size | Byte signature        |
+|----------------|-------------|-----------|------------|-----------------------|
+| **PCM 16-bit LE** | 16000 Hz | 16-bit   | 1280 bytes | `c7ff e9ff 0000 ...`  |
+| **G.711 µ-law**   | 8000 Hz  | 8-bit    | 320 bytes  | `7e 7f ff ...`        |
+
+Both produce ~250 audio chunks per 10-second `.media` file (40 ms per chunk).
+The script auto-detects the codec from the chunk size of the first audio frame.
 
 > **Note:** The H264 SPS declares 25 fps, causing ffmpeg to produce video
 > that plays at 2.5× real speed without the `-r 10` correction.
@@ -128,10 +135,11 @@ Required:
 
 Options:
   -w, --workers N       Parallel ffmpeg workers (default: 4)
+  --audio-codec CODEC   Audio codec: auto (default), pcm or mulaw
+  --sample-rate HZ      Audio sample rate — auto-detected if not set
+  --fps FPS             Real video frame rate (default: 10)
   --overwrite           Overwrite existing output files
   --tmpdir DIR          Temporary directory (default: output dir)
-  --fps FPS             Real video frame rate (default: 10)
-  --sample-rate HZ      Audio sample rate in Hz (default: 16000)
   -h, --help            Show this help message and exit
 ```
 
@@ -139,26 +147,47 @@ Options:
 
 The tool **auto-detects** the input structure:
 
-| Layout | Example | Use case |
-|--------|---------|----------|
-| SD card | `DCIM/YYYY/MM/DD/session/*.media` | Direct from mounted card |
-| Local copy | `backup/DD/session/*.media` | Copied to hard drive |
+| Layout     | Example                              | Use case                  |
+|------------|--------------------------------------|---------------------------|
+| SD card    | `DCIM/YYYY/MM/DD/session/*.media`    | Direct from mounted card  |
+| Local copy | `backup/DD/session/*.media`          | Copied to hard drive      |
+
+### Audio codec — auto-detection
+
+The script reads the first audio chunk of the first `.media` file and detects
+the codec automatically:
+
+| Chunk size | Detected codec        |
+|------------|-----------------------|
+| 1280 bytes | PCM 16-bit LE 16000Hz |
+| 320 bytes  | G.711 µ-law 8000Hz    |
+
+You can override with `--audio-codec pcm` or `--audio-codec mulaw`.
 
 ### Examples
 
-**From SD card mounted at `/media/user/AD28-21D5`:**
+**From SD card (auto-detects everything):**
 ```bash
 ./tuya_media_extract.py \
     -i /media/user/AD28-21D5/DCIM \
     -o ~/Videos/camera
 ```
 
-**From a local copy (flat DD/ layout):**
+**From a local copy with more workers:**
 ```bash
 ./tuya_media_extract.py \
     -i ~/tmp/cam-19-22-Avril2026 \
     -o ~/Videos/camera \
     --workers 8
+```
+
+**Force mulaw (override auto-detection):**
+```bash
+./tuya_media_extract.py \
+    -i ~/javcache/cam_salon \
+    -o ~/Videos/salon \
+    --audio-codec mulaw \
+    --sample-rate 8000
 ```
 
 **Force reprocessing of existing files:**
@@ -200,8 +229,8 @@ unplayable.
 ### Lossless Output
 
 - Video: `-c:v copy` — H264 bitstream copied byte-for-byte from source
-- Audio: `-c:a pcm_s16le` — PCM samples copied from source, wrapped in WAV
-  during processing then stored as raw PCM in MKV
+- Audio PCM: `-c:a pcm_s16le` — samples copied as-is into MKV
+- Audio µ-law: `-c:a pcm_mulaw` — samples copied as-is into MKV
 
 No transcoding, no quality loss.
 
@@ -225,18 +254,21 @@ No transcoding, no quality loss.
 .media files
     │
     ▼
+Audio auto-detect     ← reads first audio chunk size to identify codec
+    │
+    ▼
 Chunk parser          ← splits interleaved video/audio chunks by type
     │
     ├─ H264 NAL units ──→ raw .h264 file
-    └─ PCM samples    ──→ .wav file (with proper header)
+    └─ audio samples  ──→ .wav (PCM) or .ulaw (mulaw) file
                               │
                               ▼
-                         ffmpeg mux  ← -r 10 -c:v copy -c:a pcm_s16le
+                         ffmpeg mux  ← -r 10 -c:v copy -c:a pcm_s16le/pcm_mulaw
                               │
                               ▼
                          segment.mkv (10 seconds)
                               │
-                    (×2160 segments, parallel)
+                    (×8642 segments, parallel)
                               │
                               ▼
                     ffmpeg concat  ← -f concat -c copy
@@ -249,11 +281,16 @@ Chunk parser          ← splits interleaved video/audio chunks by type
 
 ## Camera Info
 
-- **Platform:** Tuya SmartLife
-- **Firmware:** v79.1.40
-- **Recording mode:** Continuous (24/7), not event/motion triggered
-- **SD card filesystem:** FAT32 (vfat)
-- **Tested resolution:** 1920×1080
+| Property          | Value                          |
+|-------------------|--------------------------------|
+| Platform          | Tuya SmartLife                 |
+| Firmware          | v79.1.40                       |
+| Recording mode    | Continuous (24/7)              |
+| SD card filesystem| FAT32 (vfat)                   |
+| Resolution        | 1920×1080                      |
+| Video codec       | H264 Main profile, 10 fps real |
+| Audio (outdoor)   | PCM 16-bit LE, 16000 Hz, mono  |
+| Audio (indoor)    | G.711 µ-law, 8000 Hz, mono     |
 
 ---
 
