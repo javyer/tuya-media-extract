@@ -2,20 +2,34 @@
 """
 tuya_media_extract.py - Extract and mux Tuya SmartLife camera .media files to MKV
 
+DISCLAIMER:
+  This is an independent community project, not affiliated with or endorsed by
+  Tuya Inc. or any of its subsidiaries. The .media file format was reverse-
+  engineered for personal interoperability purposes only, on unencrypted footage
+  stored on the user's own SD card. Use at your own risk.
+
 Tuya .media File Format (reverse-engineered):
 ----------------------------------------------
 Each .media file is a proprietary container with fixed-size chunk headers.
-Chunks are interleaved: video (H264) and audio (raw PCM 16-bit LE).
+Chunks are interleaved: video (H264) and audio (PCM or G.711 µ-law).
 
 Chunk structure (24-byte header):
   Offset 0  : uint32 LE  - chunk type
                   0 = video frame (P/B-frame)
                   1 = video keyframe (I-frame / SPS+PPS)
-                  3 = audio frame (PCM 16-bit signed LE, 16000 Hz, mono)
+                  3 = audio frame
   Offset 4  : uint32 LE  - payload size in bytes
   Offset 8  : uint64 LE  - timestamp (camera epoch, not Unix)
   Offset 16 : uint64 LE  - unknown (sequence / flags)
-  Offset 24 : <payload>  - raw H264 NAL units or PCM samples
+  Offset 24 : <payload>  - raw H264 NAL units or audio samples
+
+Known audio codecs (varies by camera model / firmware):
+  PCM   : 16-bit signed little-endian, 16000 Hz, mono
+          chunk size = 1280 bytes, ~250 chunks per 10s segment
+          signature : small signed values e.g. c7ff e9ff 0000 ...
+  mulaw : G.711 µ-law, 8-bit, 8000 Hz, mono
+          chunk size = 320 bytes, ~250 chunks per 10s segment
+          signature : values around 0x7e/0x7f/0xff (silence = 0x7f)
 
 SD card layout (continuous recording, not event-based):
   DCIM/
@@ -24,19 +38,23 @@ SD card layout (continuous recording, not event-based):
         DD/
           <unix_timestamp>_<session_id>/
             .info          - JSON: version, eventType, codec
-            0000.media     - 10-second segment (100 frames @ 10fps)
+            0000.media     - 10-second segment (~100 frames @ 10fps)
             0010.media
             ...
             0590.media     - last segment of the 10-minute session
 
+The input directory can be either:
+  - The full SD card DCIM root  -> YYYY/MM/DD/session/*.media
+  - A local flat copy           -> DD/session/*.media
+The script auto-detects both layouts.
+
 Each session folder = 10 minutes of continuous footage.
-Each .media file   = 10 seconds, 100 video frames, 250 audio chunks.
-Audio chunk size   = 1280 bytes = 640 samples = 40ms @ 16000 Hz.
+Each .media file   = 10 seconds, ~100 video frames, ~250 audio chunks.
 """
 
 import argparse
 import io
-import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -45,15 +63,23 @@ import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+
+def _sigint_handler(sig, frame):
+    print("\nInterrupted.")
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
 # ── Tuya .media format constants ─────────────────────────────────────────────
 CHUNK_HEADER_SIZE  = 24       # bytes per chunk header
 CHUNK_TYPE_VIDEO_P = 0        # P/B-frame (inter)
 CHUNK_TYPE_VIDEO_I = 1        # I-frame / keyframe (intra)
-CHUNK_TYPE_AUDIO   = 3        # PCM audio frame
-AUDIO_SAMPLE_RATE  = 16000    # Hz
-AUDIO_CHANNELS     = 1        # mono
-AUDIO_SAMPLE_WIDTH = 2        # bytes (16-bit)
-VIDEO_FPS          = 10       # real frame rate (declared as 25 in SPS, actual 10)
+CHUNK_TYPE_AUDIO   = 3        # audio frame (PCM or µ-law depending on camera)
+
+# Default values (camera-dependent, override with CLI flags)
+DEFAULT_FPS         = 10      # real frame rate (SPS declares 25, actual is 10)
+DEFAULT_SAMPLE_RATE = 16000   # Hz  (PCM cameras)
+DEFAULT_AUDIO_CODEC = "pcm"   # pcm or mulaw
 
 
 def parse_args():
@@ -65,17 +91,40 @@ def parse_args():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Audio codec detection:
+  PCM   cameras : chunk size=1280, values like c7ff e9ff (16-bit signed LE)
+  mulaw cameras : chunk size=320,  values like 7e 7f ff  (G.711 u-law 8-bit)
+
+Input layouts supported (auto-detected):
+  SD card : -i /media/user/SD_CARD/DCIM    (DCIM/YYYY/MM/DD/session/*.media)
+  Local   : -i ~/sdcard_copy               (DD/session/*.media)
+
 Examples:
+  # PCM camera (default)
   %(prog)s -i /media/user/SD_CARD/DCIM -o ~/Videos/camera
+
+  # G.711 u-law camera (e.g. indoor cam)
+  %(prog)s -i ~/javcache/cam_salon -o ~/Videos/salon --audio-codec mulaw --sample-rate 8000
+
+  # More parallel workers
   %(prog)s -i /media/user/SD_CARD/DCIM -o ~/Videos/camera --workers 8
-  %(prog)s -i /mnt/sdcard -o /nas/cctv --overwrite
+
+  # Force reprocess existing files
+  %(prog)s -i /media/user/SD_CARD/DCIM -o ~/Videos/camera --overwrite
+
+DISCLAIMER:
+  This tool is not affiliated with or endorsed by Tuya Inc.
+  Reverse-engineered for personal interoperability use only.
         """,
     )
     parser.add_argument(
         "-i", "--input",
         required=True,
         metavar="DIR",
-        help="Input directory: root of the Tuya DCIM folder on the SD card",
+        help=(
+            "Input directory: SD card DCIM root (YYYY/MM/DD/session/) "
+            "or local copy (DD/session/). Structure is auto-detected."
+        ),
     )
     parser.add_argument(
         "-o", "--output",
@@ -104,25 +153,38 @@ Examples:
     parser.add_argument(
         "--fps",
         type=float,
-        default=VIDEO_FPS,
+        default=DEFAULT_FPS,
         metavar="FPS",
-        help=f"Real video frame rate (default: {VIDEO_FPS})",
+        help=f"Real video frame rate (default: {DEFAULT_FPS})",
     )
     parser.add_argument(
         "--sample-rate",
         type=int,
-        default=AUDIO_SAMPLE_RATE,
+        default=DEFAULT_SAMPLE_RATE,
         metavar="HZ",
-        help=f"Audio sample rate in Hz (default: {AUDIO_SAMPLE_RATE})",
+        help=(
+            "Audio sample rate in Hz (default: auto-detected). "
+            "Override only if auto-detection fails."
+        ),
+    )
+    parser.add_argument(
+        "--audio-codec",
+        choices=["pcm", "mulaw"],
+        default=DEFAULT_AUDIO_CODEC,
+        metavar="CODEC",
+        help=(
+            "Audio codec: pcm or mulaw (default: auto-detected). "
+            "Override only if auto-detection fails."
+        ),
     )
     return parser.parse_args()
 
 
-def demux_media(media_file: Path, sample_rate: int):
+def demux_media(media_file: Path):
     """
     Parse a single .media file and return (video_bytes, audio_bytes).
-    Video  : concatenated raw H264 NAL units (types 0 and 1).
-    Audio  : concatenated PCM 16-bit LE samples (type 3).
+    Video : concatenated raw H264 NAL units (chunk types 0 and 1).
+    Audio : concatenated raw audio samples (chunk type 3).
     """
     with open(media_file, "rb") as f:
         data = f.read()
@@ -135,7 +197,6 @@ def demux_media(media_file: Path, sample_rate: int):
         chunk_type = struct.unpack_from("<I", data, offset)[0]
         chunk_size = struct.unpack_from("<I", data, offset + 4)[0]
 
-        # Sanity check
         if chunk_size == 0 or offset + CHUNK_HEADER_SIZE + chunk_size > len(data):
             break
 
@@ -152,40 +213,52 @@ def demux_media(media_file: Path, sample_rate: int):
 
 
 def build_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
-    """Wrap raw PCM bytes in a proper WAV container."""
+    """Wrap raw PCM 16-bit LE bytes in a WAV container."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(AUDIO_CHANNELS)
-        wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
+        wf.setnchannels(1)       # mono
+        wf.setsampwidth(2)       # 16-bit
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
 
 
-def mux_segment(media_file: Path, tmpdir: Path, fps: float, sample_rate: int) -> Path:
+def mux_segment(media_file: Path, tmpdir: Path, args) -> Path:
     """
-    Demux one .media file and mux into a temporary MKV segment.
+    Demux one .media file and mux video + audio into a temporary MKV segment.
+    Handles both PCM and G.711 µ-law audio codecs.
     Returns the path to the .mkv segment.
     """
-    video_bytes, audio_bytes = demux_media(media_file, sample_rate)
+    video_bytes, audio_bytes = demux_media(media_file)
 
-    # Unique stem to avoid collisions when sessions overlap
+    # Unique stem avoids filename collisions across sessions
     unique  = f"{media_file.parent.name}_{media_file.stem}"
     vpath   = tmpdir / f"{unique}.h264"
-    apath   = tmpdir / f"{unique}.wav"
     mkvpath = tmpdir / f"{unique}.mkv"
 
     vpath.write_bytes(video_bytes)
-    apath.write_bytes(build_wav(audio_bytes, sample_rate))
+
+    if args.audio_codec == "mulaw":
+        # G.711 µ-law: write raw bytes, tell ffmpeg the format explicitly
+        apath = tmpdir / f"{unique}.ulaw"
+        apath.write_bytes(audio_bytes)
+        audio_input_args  = ["-f", "mulaw", "-ar", str(args.sample_rate), "-i", str(apath)]
+        audio_encode_args = ["-c:a", "pcm_mulaw"]   # lossless copy in MKV
+    else:
+        # PCM 16-bit LE: wrap in WAV so ffmpeg auto-detects format
+        apath = tmpdir / f"{unique}.wav"
+        apath.write_bytes(build_wav(audio_bytes, args.sample_rate))
+        audio_input_args  = ["-i", str(apath)]
+        audio_encode_args = ["-c:a", "pcm_s16le"]   # lossless copy in MKV
 
     subprocess.run(
         [
             "ffmpeg", "-y",
-            "-f", "h264", "-r", str(fps), "-i", str(vpath),  # raw H264 input
-            "-i", str(apath),                                  # WAV input
-            "-c:v", "copy",                                    # lossless video copy
-            "-c:a", "pcm_s16le",                              # lossless audio copy
-            "-async", "1",                                     # fix minor A/V drift
+            "-f", "h264", "-r", str(args.fps), "-i", str(vpath),
+            *audio_input_args,
+            "-c:v", "copy",          # lossless video: bit-for-bit H264 copy
+            *audio_encode_args,      # lossless audio: bit-for-bit copy
+            "-async", "1",           # correct minor A/V drift at boundaries
             str(mkvpath),
         ],
         stderr=subprocess.DEVNULL,
@@ -206,32 +279,34 @@ def process_day(day_dir: Path, out_file: Path, args):
     total    = len(media_files)
     tmp_root = Path(args.tmpdir) if args.tmpdir else Path(args.output)
 
-    print(f"→ {out_file.name}  ({total} segments)")
+    print(f"-> {out_file.name}  ({total} segments, audio={args.audio_codec} {args.sample_rate}Hz)")
 
     with tempfile.TemporaryDirectory(dir=str(tmp_root)) as tmpdir:
         tmpdir  = Path(tmpdir)
         results = {}
 
-        # Parallel muxing of individual segments
+        # Parallel muxing of individual 10-second segments
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {
-                executor.submit(mux_segment, m, tmpdir, args.fps, args.sample_rate): m
+                executor.submit(mux_segment, m, tmpdir, args): m
                 for m in media_files
             }
             done = 0
             for future in as_completed(futures):
-                media         = futures[future]
+                media          = futures[future]
                 results[media] = future.result()
                 done          += 1
-                print(f"  {done}/{total}", end="\r", flush=True)
+                print(f"  {done}/{total}  ", end="\r", flush=True)
 
-        # Build concat list in strict chronological order
+        print()  # clean newline after \r progress
+
+        # Concat list must be in strict chronological order
         concat_list = tmpdir / "concat.txt"
         with open(concat_list, "w") as lst:
             for media in media_files:
                 lst.write(f"file '{results[media]}'\n")
 
-        print(f"\n  Concatenating into {out_file.name} …")
+        print(f"\n  Concatenating into {out_file.name} ...")
         subprocess.run(
             [
                 "ffmpeg", "-y",
@@ -244,10 +319,58 @@ def process_day(day_dir: Path, out_file: Path, args):
             check=False,
         )
 
-    print(f"  ✅ {out_file.name}")
+    print(f"  OK {out_file.name}")
 
 
 def main():
+    try:
+        _main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(1)
+    finally:
+        print(end="", flush=True)  # ensure terminal is clean on any exit
+
+
+def detect_audio_format(sdcard: Path):
+    """
+    Auto-detect audio codec and sample rate from the first .media file found.
+    Detection is based on audio chunk size:
+      1280 bytes -> PCM 16-bit LE @ 16000 Hz
+      320  bytes -> G.711 µ-law   @  8000 Hz
+    """
+    media = next(sdcard.rglob("*.media"), None)
+    if not media:
+        return DEFAULT_AUDIO_CODEC, DEFAULT_SAMPLE_RATE
+
+    with open(media, "rb") as f:
+        data = f.read()
+
+    offset = 0
+    while offset < len(data) - CHUNK_HEADER_SIZE:
+        chunk_type = struct.unpack_from("<I", data, offset)[0]
+        chunk_size = struct.unpack_from("<I", data, offset + 4)[0]
+        if chunk_size == 0 or offset + CHUNK_HEADER_SIZE + chunk_size > len(data):
+            break
+        if chunk_type == CHUNK_TYPE_AUDIO:
+            if chunk_size == 320:
+                print(f"  audio detected: G.711 mulaw 8000Hz (chunk={chunk_size}B)")
+                return "mulaw", 8000
+            elif chunk_size == 1280:
+                print(f"  audio detected: PCM 16-bit 16000Hz (chunk={chunk_size}B)")
+                return "pcm", 16000
+            else:
+                # Unknown chunk size — best-effort guess
+                guessed_rate = (chunk_size // 2) // 10
+                print(f"  WARNING: unknown audio chunk size={chunk_size}B, guessing {guessed_rate}Hz PCM")
+                return "pcm", guessed_rate
+        offset += CHUNK_HEADER_SIZE + chunk_size
+
+    print("  WARNING: no audio chunk found, using defaults")
+    return DEFAULT_AUDIO_CODEC, DEFAULT_SAMPLE_RATE
+
+
+def _main():
     args   = parse_args()
     sdcard = Path(args.input)
     output = Path(args.output)
@@ -258,10 +381,10 @@ def main():
 
     output.mkdir(parents=True, exist_ok=True)
 
-    # Auto-detect day dirs: parent of session folders (which contain .media files)
+    # Auto-detect day dirs: grandparent of .media files
     # Works with both:
-    #   SD card layout : DCIM/YYYY/MM/DD/session/*.media
-    #   Local copy     : input/DD/session/*.media
+    #   SD card layout : DCIM/YYYY/MM/DD/session/*.media  -> 3 path parts
+    #   Local copy     : input/DD/session/*.media          -> 1 path part
     day_dirs = sorted(set(
         m.parent.parent
         for m in sdcard.rglob("*.media")
@@ -271,24 +394,31 @@ def main():
         print(f"ERROR: no .media files found under {sdcard}", file=sys.stderr)
         sys.exit(1)
 
+    # Auto-detect audio format unless explicitly overridden by user
+    if args.audio_codec == DEFAULT_AUDIO_CODEC and args.sample_rate == DEFAULT_SAMPLE_RATE:
+        print("Auto-detecting audio format...")
+        args.audio_codec, args.sample_rate = detect_audio_format(sdcard)
+    else:
+        print(f"  audio: {args.audio_codec} {args.sample_rate}Hz (forced)")
+
     for day_dir in day_dirs:
-        # Build date string from path — handle both YYYY/MM/DD and plain DD
         parts = day_dir.relative_to(sdcard).parts
         if len(parts) == 3:
             date_str = f"{parts[0]}-{parts[1]}-{parts[2]}"   # YYYY/MM/DD
         elif len(parts) == 1:
-            date_str = f"day-{parts[0]}"                       # plain DD (local copy)
+            date_str = f"day-{parts[0]}"                       # plain DD
         else:
             date_str = "-".join(parts)                         # fallback
-        out_file  = output / f"{date_str}_full.mkv"
+
+        out_file = output / f"{date_str}_full.mkv"
 
         if out_file.exists() and not args.overwrite:
-            print(f"⏭️  {out_file.name} already exists, skipping (use --overwrite)")
+            print(f"skip: {out_file.name} already exists (use --overwrite)")
             continue
 
         process_day(day_dir, out_file, args)
 
-    print("\n✅ All done!")
+    print("\nAll done!")
 
 
 if __name__ == "__main__":
